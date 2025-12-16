@@ -66,8 +66,8 @@ app.post("/proxy/analyze", upload.single("file"), async (req, res) => {
         {
           role: "user",
           content: [
-            {
-              type: "input_text",
+            { type: "input_text", text: `User note: ${note}` },
+            { type: "input_file", file_id: uploaded.id },
               text:
                 "ENGLISH (output first):\n" +
                 "You are the SpicyCarWorks Log Assistant.\n" +
