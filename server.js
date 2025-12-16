@@ -50,51 +50,45 @@ app.post("/proxy/analyze", upload.single("file"), async (req, res) => {
         type: "code_interpreter",
         container: { type: "auto", file_ids: [uploaded.id] }
       }],
-      input: `
-You are a professional BMW calibration engineer.
+      instructions: `
+You are a vehicle data analysis engine.
 
-STRICT RULES:
-- Customer-facing output only
-- No internal reasoning, no parsing explanation
-- No upsell, no marketing, no assumptions
-- Only use values explicitly present in the log
-- If data is missing: say "Data not available"
+ABSOLUTE RULES (VIOLATION = FAILURE):
+- Do NOT explain steps.
+- Do NOT describe what you are doing.
+- Do NOT guess values.
+- Do NOT write advice, upsell, or questions.
+- Output ONLY calculated results.
 
-BOOST RULE:
-- Boost values are in PSI
-- Prefer Boost Actual or Manifold Pressure
-- NEVER report boost below 5 PSI unless clearly shown
+DATA RULES:
+- Only use numeric columns.
+- Detect column names dynamically.
+- If a value cannot be calculated → output "not determinable".
+- Never assume units.
+- Never infer boost from RPM or load.
 
-OUTPUT FORMAT (STRICT):
+BOOST HANDLING (CRITICAL):
+- Use only columns containing: boost, map, manifold, charge, tmap.
+- If unit = bar → convert to PSI.
+- If unit = kPa:
+  - If average > 120 → treat as absolute and subtract 101.325
+  - Else → treat as gauge
+- If unclear → not determinable.
 
-=== LOG ANALYSIS SUMMARY ===
+OUTPUT FORMAT (JSON ONLY):
+{
+  "boost_psi": { "min": number|null, "avg": number|null, "max": number|null },
+  "rpm": { "min": number|null, "max": number|null },
+  "iat": { "min": number|null, "max": number|null, "unit": "C|F|null" },
+  "lambda": { "min": number|null, "max": number|null },
+  "confidence": "high|medium|low"
+}
 
-Boost:
-- Peak boost (PSI):
-- Average boost under load (PSI):
-- Boost behavior:
-
-Fueling:
-- AFR / Lambda:
-- Rail pressure:
-- Fuel limits detected: Yes/No
-
-Timing / Knock:
-- Timing behavior:
-- Knock corrections: Yes/No
-
-IAT:
-- Average IAT:
-- Peak IAT:
-
-Conclusion:
-- Max 3 short customer-friendly sentences
-`
 
 
 res.json({
-      text: response.output_text || "Keine Ausgabe."
-    });
+  result: response.output_parsed || response.output_text || "Analyse nicht möglich"
+});
 
   } catch (e) {
     res.status(500).json({
