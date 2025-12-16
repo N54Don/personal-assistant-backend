@@ -63,7 +63,12 @@ app.post("/proxy/analyze", upload.single("file"), async (req, res) => {
     // IMPORTANT: attach the file as input_file (so Code Interpreter can actually read it)
     const response = await openai.responses.create({
       model: "gpt-4.1",
-      tools: [{ type: "code_interpreter" }],
+      tools: [
+  {
+    type: "code_interpreter",
+    container: { type: "auto", file_ids: [uploaded.id] },
+  },
+],
       instructions: `
 ENGLISH (output first):
 You are the SpicyCarWorks Log Assistant.
