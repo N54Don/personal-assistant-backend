@@ -54,7 +54,10 @@ app.post("/proxy/analyze", upload.single("file"), async (req, res) => {
     const note = req.body?.note || "";
 
     // Upload file to OpenAI
-    const f = await toFile(req.file.buffer, req.file.originalname || "log.csv");
+    const safeName =
+  (req.file.originalname || "log.csv").replace(/\.csv$/i, ".txt") || "log.txt";
+
+const f = await toFile(req.file.buffer, safeName);
     const uploaded = await openai.files.create({
       file: f,
       purpose: "assistants",
