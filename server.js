@@ -6,6 +6,20 @@ import { toFile } from "openai/uploads";
 import cors from "cors";
 
 const app = express();
+app.set("trust proxy", 1);
+
+app.use(cors({
+  origin: [
+    "https://spicycarworks.com",
+    "https://www.spicycarworks.com",
+    "https://spicycarworks.myshopify.com"
+  ],
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type"]
+}));
+
+app.options("*", cors());
+
 const upload = multer({ limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB
 
 app.use("/proxy/analyze", rateLimit({
