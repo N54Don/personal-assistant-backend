@@ -50,14 +50,47 @@ app.post("/proxy/analyze", upload.single("file"), async (req, res) => {
         type: "code_interpreter",
         container: { type: "auto", file_ids: [uploaded.id] }
       }],
-      instructions: `
-Du bist der "Personal Assistent" von SpicyCarWorks.
-Kurzfazit, Flags (Fueling/Timing/Boost/IAT), Next Steps.
-Deutsch, kurz, technisch. Kein Verkaufston.
-Upsell nur wenn echte Auffälligkeiten. Max 1 Satz am Ende.
-`,
-      input: `Zusatzinfos vom Nutzer: ${note}\nAnalysiere den angehängten Log.`
-    });
+      input: `
+You are a professional BMW calibration engineer.
+
+STRICT RULES:
+- Customer-facing output only
+- No internal reasoning, no parsing explanation
+- No upsell, no marketing, no assumptions
+- Only use values explicitly present in the log
+- If data is missing: say "Data not available"
+
+BOOST RULE:
+- Boost values are in PSI
+- Prefer Boost Actual or Manifold Pressure
+- NEVER report boost below 5 PSI unless clearly shown
+
+OUTPUT FORMAT (STRICT):
+
+=== LOG ANALYSIS SUMMARY ===
+
+Boost:
+- Peak boost (PSI):
+- Average boost under load (PSI):
+- Boost behavior:
+
+Fueling:
+- AFR / Lambda:
+- Rail pressure:
+- Fuel limits detected: Yes/No
+
+Timing / Knock:
+- Timing behavior:
+- Knock corrections: Yes/No
+
+IAT:
+- Average IAT:
+- Peak IAT:
+
+Conclusion:
+- Max 3 short customer-friendly sentences
+`
+
 
     res.json({ text: response.output_text || "Keine Ausgabe." });
   } catch (e) {
