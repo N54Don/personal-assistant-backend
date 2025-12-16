@@ -45,7 +45,7 @@ app.post("/proxy/analyze", upload.single("file"), async (req, res) => {
 
     // 2) Run Code Interpreter with that file available in the container
     const response = await openai.responses.create({
-      model: "gpt-4.1-mini",
+      model: "gpt-4.1",
       tools: [{
         type: "code_interpreter",
         container: { type: "auto", file_ids: [uploaded.id] }
