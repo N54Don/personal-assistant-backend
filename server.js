@@ -92,9 +92,14 @@ Conclusion:
 `
 
 
-    res.json({ text: response.output_text || "Keine Ausgabe." });
+res.json({
+      text: response.output_text || "Keine Ausgabe."
+    });
+
   } catch (e) {
-    res.status(500).json({ error: "Analyse fehlgeschlagen: " + (e?.message || String(e)) });
+    res.status(500).json({
+      error: "Analyse fehlgeschlagen: " + (e?.message || String(e))
+    });
   }
 });
 
