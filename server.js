@@ -1,13 +1,14 @@
 import express from "express";
 import multer from "multer";
 import rateLimit from "express-rate-limit";
-import OpenAI from "openai";
 import cors from "cors";
+import OpenAI from "openai";
 import Papa from "papaparse";
 
 const app = express();
 app.set("trust proxy", 1);
 
+// ---------- CORS ----------
 app.use(
   cors({
     origin: [
@@ -19,260 +20,420 @@ app.use(
     allowedHeaders: ["Content-Type"],
   })
 );
-
 app.options("*", cors());
 
-const upload = multer({ limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB
+// ---------- Upload ----------
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
+});
 
+// ---------- Rate limit ----------
 app.use(
   "/proxy/analyze",
   rateLimit({
     windowMs: 60 * 60 * 1000,
-    limit: 20,
+    limit: 10,
   })
 );
 
+// ---------- OpenAI ----------
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-app.get("/proxy", (req, res) => res.send("Personal Assistent Backend läuft"));
+// ---------- Helpers ----------
+function normalizeNewlines(s) {
+  return String(s || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
 
-/** ---------- Helpers ---------- **/
-function norm(s) {
+function detectDelimiter(sampleLine) {
+  const candidates = [",", ";", "\t", "|"];
+  const counts = candidates.map((d) => ({
+    d,
+    c: (sampleLine.match(new RegExp(`\\${d}`, "g")) || []).length,
+  }));
+  counts.sort((a, b) => b.c - a.c);
+  return counts[0]?.c > 0 ? counts[0].d : ",";
+}
+
+function looksLikeHeader(line, delim) {
+  const parts = line.split(delim).map((p) => p.trim());
+  if (parts.length < 3) return false;
+
+  // header tends to have many non-numeric tokens
+  let nonNumeric = 0;
+  for (const p of parts) {
+    const x = p.replace(/["']/g, "").trim();
+    if (!x) continue;
+    const n = Number(x.replace(",", "."));
+    if (!Number.isFinite(n)) nonNumeric++;
+  }
+  return nonNumeric >= Math.max(2, Math.floor(parts.length * 0.4));
+}
+
+function findHeaderLineIndex(lines) {
+  // scan first ~50 lines
+  const maxScan = Math.min(lines.length, 50);
+  let bestIdx = -1;
+  let bestScore = -1;
+  for (let i = 0; i < maxScan; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const delim = detectDelimiter(line);
+    const parts = line.split(delim);
+    const score = parts.length; // more columns usually = real header
+    if (looksLikeHeader(line, delim) && score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+function normalizeLogCsv(rawText) {
+  const text = normalizeNewlines(rawText);
+  const lines = text.split("\n");
+
+  const headerIdx = findHeaderLineIndex(lines);
+  if (headerIdx < 0) throw new Error("Header not found");
+
+  const headerLine = lines[headerIdx];
+  const delimiter = detectDelimiter(headerLine);
+
+  const dataText = lines.slice(headerIdx).join("\n");
+
+  // Parse with Papa (header: true)
+  const parsed = Papa.parse(dataText, {
+    header: true,
+    delimiter,
+    skipEmptyLines: true,
+    dynamicTyping: false,
+  });
+
+  if (parsed.errors?.length) {
+    // try again without forcing delimiter
+    const parsed2 = Papa.parse(dataText, {
+      header: true,
+      skipEmptyLines: true,
+      dynamicTyping: false,
+    });
+    if (!parsed2.data?.length) throw new Error("No usable rows");
+    return {
+      rows: parsed2.data,
+      fields: parsed2.meta?.fields || Object.keys(parsed2.data[0] || {}),
+      info: { headerIdx, detectedDelimiter: "auto", rows: parsed2.data.length },
+    };
+  }
+
+  if (!parsed.data?.length) throw new Error("No usable rows");
+
+  const fields = parsed.meta?.fields || Object.keys(parsed.data[0] || {});
+  return {
+    rows: parsed.data,
+    fields,
+    info: { headerIdx, detectedDelimiter: delimiter, rows: parsed.data.length },
+  };
+}
+
+function normKey(s) {
   return String(s || "")
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "");
+    .replace(/[\s\-_()/[\].:%]/g, "");
 }
 
-function pickColumn(columns, keywords) {
-  // columns: original names array
-  const ncols = columns.map((c) => ({ orig: c, n: norm(c) }));
-  for (const kw of keywords) {
-    const nkw = norm(kw);
-    const exact = ncols.find((c) => c.n === nkw);
-    if (exact) return exact.orig;
+function pickColumn(fields, candidates) {
+  // returns { name, score } or null
+  let best = null;
+  for (const f of fields) {
+    const fk = normKey(f);
+    for (const c of candidates) {
+      const ck = normKey(c);
+      if (!ck) continue;
+      let score = 0;
+      if (fk === ck) score = 100;
+      else if (fk.includes(ck) || ck.includes(fk)) score = 60;
+      else if (fk.startsWith(ck) || ck.startsWith(fk)) score = 50;
+      if (score > (best?.score || 0)) best = { name: f, score };
+    }
   }
-  // contains match
-  for (const kw of keywords) {
-    const nkw = norm(kw);
-    const hit = ncols.find((c) => c.n.includes(nkw));
-    if (hit) return hit.orig;
-  }
-  return null;
+  return best && best.score >= 40 ? best : null;
 }
 
-function toNum(v) {
+function toNumberLoose(v) {
   if (v === null || v === undefined) return null;
   const s = String(v).trim();
   if (!s) return null;
-  // support comma decimals
-  const cleaned = s.replace(",", ".");
-  const x = Number(cleaned);
-  return Number.isFinite(x) ? x : null;
+  const n = Number(s.replace(",", "."));
+  return Number.isFinite(n) ? n : null;
 }
 
-function stats(arr) {
-  const a = arr.filter((x) => Number.isFinite(x));
-  if (!a.length) return null;
-  let min = a[0], max = a[0], sum = 0;
-  for (const x of a) {
-    if (x < min) min = x;
-    if (x > max) max = x;
-    sum += x;
+function sampleRows(rows, max = 400) {
+  if (rows.length <= max) return rows;
+  const step = Math.ceil(rows.length / max);
+  const out = [];
+  for (let i = 0; i < rows.length; i += step) out.push(rows[i]);
+  return out;
+}
+
+function minMax(arr) {
+  let min = Infinity;
+  let max = -Infinity;
+  let count = 0;
+  for (const v of arr) {
+    if (!Number.isFinite(v)) continue;
+    count++;
+    if (v < min) min = v;
+    if (v > max) max = v;
   }
-  return { min, max, avg: sum / a.length, n: a.length };
+  if (!count) return null;
+  return { min, max, count };
 }
 
-function detectBoostUnit(colName, values) {
-  const n = norm(colName);
-  const s = stats(values);
-  if (!s) return { unit: null, kind: null };
+function detectPressureUnit(series) {
+  // crude unit guess from value ranges
+  // psi boost often 0..40 (gauge) or 14..55 (absolute)
+  // kPa often 80..300, bar often 0.8..3.0 (abs) or 0..2.5 (gauge)
+  const stats = minMax(series);
+  if (!stats) return { unit: null, kind: null };
 
-  // name-based
-  if (n.includes("kpa")) return { unit: "kpa", kind: "pressure" };
-  if (n.includes("bar")) return { unit: "bar", kind: "pressure" };
-  if (n.includes("psi")) return { unit: "psi", kind: "pressure" };
+  const { min, max } = stats;
 
-  // value-based heuristic
-  // kPa absolute usually ~80..300
-  if (s.max > 60 && s.max < 500) return { unit: "kpa", kind: "pressure" };
-  // bar absolute usually ~0.8..3.5
-  if (s.max > 0.5 && s.max < 6) return { unit: "bar", kind: "pressure" };
-  // psi usually ~0..60
-  if (s.max > 6 && s.max < 120) return { unit: "psi", kind: "pressure" };
+  if (max <= 5 && min >= 0) return { unit: "bar", kind: "pressure" };
+  if (max > 50 && max <= 400) return { unit: "kPa", kind: "pressure" };
+  if (max > 5 && max <= 120) return { unit: "psi", kind: "pressure" };
 
-  return { unit: null, kind: null };
+  return { unit: null, kind: "pressure" };
 }
 
-function pressureToPsi(value, unit) {
-  if (!Number.isFinite(value)) return null;
-  if (unit === "psi") return value;
-  if (unit === "kpa") return value * 0.1450377;
-  if (unit === "bar") return value * 14.50377;
+function pressureToPsi(v, unit) {
+  if (!Number.isFinite(v)) return null;
+  if (unit === "psi") return v;
+  if (unit === "kPa") return v * 0.1450377;
+  if (unit === "bar") return v * 14.50377;
   return null;
 }
 
-function isProbablyAbsolutePressurePsi(psiStats) {
-  // If minimum is near atmospheric (≈14.7 psi) or (kPa~101), it's likely absolute.
-  // In psi domain: abs pressure at idle often ~13..16 psi. Boosted might go to 30-45 psi abs.
+function likelyAbsolutePressurePsi(psiStats) {
+  // if minimum sits near atmospheric absolute (~14.7 psi), it's probably absolute
   if (!psiStats) return false;
   return psiStats.min > 10 && psiStats.min < 18;
 }
 
-/** ---------- Main analyze endpoint ---------- **/
+// ---------- Routes ----------
+app.get("/proxy", (req, res) => res.send("Personal Assistant Backend läuft"));
+app.get("/", (req, res) => res.send("OK"));
+
 app.post("/proxy/analyze", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Keine CSV-Datei erhalten." });
-
     const note = (req.body?.note || "").toString();
 
-    // 1) Parse CSV locally (NO OpenAI file upload)
-    const csvText = req.file.buffer.toString("utf8");
+    // 1) Normalize & parse locally
+    const rawText = req.file.buffer.toString("utf8");
+    let norm;
+    try {
+      norm = normalizeLogCsv(rawText);
+    } catch (e) {
+      return res.json({
+        text:
+          "Could not parse this file reliably. Please export as CSV with a single header row and consistent delimiter.\n\n" +
+          "Konnte die Datei nicht zuverlässig einlesen. Bitte als CSV mit einer einzigen Header-Zeile und konsistentem Trennzeichen exportieren.",
+      });
+    }
 
-    const parsed = Papa.parse(csvText, {
-      header: true,
-      dynamicTyping: false,
-      skipEmptyLines: true,
-      transformHeader: (h) => String(h || "").trim(),
+    const { rows, fields, info } = norm;
+
+    // 2) Detect columns (best-effort, different loggers supported)
+    const colTime = pickColumn(fields, ["time", "timestamp", "t", "zeit", "sec", "s"]);
+    const colRpm = pickColumn(fields, ["rpm", "engine rpm", "motordrehzahl", "n", "enginerpm"]);
+    const colPedal = pickColumn(fields, ["pedal", "accelerator", "accel", "ap", "gaspedal", "pedalpos"]);
+    const colThrottle = pickColumn(fields, ["throttle", "throttlepos", "drossel", "tp", "throttle angle"]);
+    const colBoost = pickColumn(fields, ["boost", "map", "manifold", "charge", "ld", "saugrohr", "pressure", "boostpsi", "mapkpa"]);
+    const colIat = pickColumn(fields, ["iat", "intake", "ansaugluft", "intake air", "charge air temp"]);
+    const colLambda = pickColumn(fields, ["lambda", "afr", "wideband", "o2", "equivalence"]);
+    const colIgn = pickColumn(fields, ["ign", "timing", "spark", "zw", "zünd", "ignition", "spark advance"]);
+
+    // 3) Build numeric arrays
+    const rpmArr = colRpm ? rows.map((r) => toNumberLoose(r[colRpm.name])) : [];
+    const pedalArr = colPedal ? rows.map((r) => toNumberLoose(r[colPedal.name])) : [];
+    const throttleArr = colThrottle ? rows.map((r) => toNumberLoose(r[colThrottle.name])) : [];
+
+    const boostRawArr = colBoost ? rows.map((r) => toNumberLoose(r[colBoost.name])) : [];
+    const iatArr = colIat ? rows.map((r) => toNumberLoose(r[colIat.name])) : [];
+    const lambdaArr = colLambda ? rows.map((r) => toNumberLoose(r[colLambda.name])) : [];
+    const ignArr = colIgn ? rows.map((r) => toNumberLoose(r[colIgn.name])) : [];
+
+    // 4) WOT detection (pedal OR throttle)
+    const wotMask = rows.map((_, i) => {
+      const p = pedalArr[i];
+      const t = throttleArr[i];
+      // treat 90+ as WOT, also handle 0..1 normalized
+      const pW = Number.isFinite(p) ? (p <= 1.2 ? p >= 0.9 : p >= 90) : false;
+      const tW = Number.isFinite(t) ? (t <= 1.2 ? t >= 0.9 : t >= 90) : false;
+      return pW || tW;
     });
 
-    if (parsed.errors?.length) {
-      return res.json({
-        text:
-          "Could not parse this file reliably. Please export as CSV with a single header row and consistent delimiter.\n\n" +
-          "Konnte die Datei nicht zuverlässig einlesen. Bitte als CSV mit einer einzigen Header-Zeile und konsistentem Trennzeichen exportieren.",
-      });
+    function filterByMask(arr, mask) {
+      const out = [];
+      for (let i = 0; i < arr.length; i++) if (mask[i]) out.push(arr[i]);
+      return out;
     }
 
-    const rows = parsed.data || [];
-    const columns = parsed.meta?.fields || [];
+    // 5) Pressure interpretation (boost column could be psi/kPa/bar and abs vs gauge)
+    let boostPsiArr = [];
+    let boostPsiGaugeArr = [];
+    let boostMeta = { detected: null, absoluteLikely: null, unit: null };
 
-    if (!rows.length || !columns.length) {
-      return res.json({
-        text:
-          "Could not parse this file reliably. Please export as CSV with a single header row and consistent delimiter.\n\n" +
-          "Konnte die Datei nicht zuverlässig einlesen. Bitte als CSV mit einer einzigen Header-Zeile und konsistentem Trennzeichen exportieren.",
-      });
-    }
-
-    // 2) Auto-detect columns
-    const colRPM = pickColumn(columns, ["rpm", "engine speed", "enginespeed"]);
-    const colPedal = pickColumn(columns, ["pedal", "accelerator", "acc pedal", "throttle", "throttlepos", "tp", "driver demand"]);
-    const colIAT = pickColumn(columns, ["iat", "intake air temp", "intakeairtemp", "charge air temp", "tmap", "imtemp"]);
-    const colLambda = pickColumn(columns, ["lambda", "afr", "wideband", "bank1lambda", "lambdawert"]);
-    const colIgn = pickColumn(columns, ["ignition", "timing", "spark", "zwinkel", "ign", "ignition timing"]);
-    const colBoost = pickColumn(columns, [
-      "boost",
-      "boostpsi",
-      "manifold",
-      "map",
-      "tmap",
-      "charge pressure",
-      "intake manifold pressure",
-      "boost actual",
-      "boost target",
-      "pressure",
-    ]);
-
-    // 3) Extract numeric arrays
-    const rpm = colRPM ? rows.map((r) => toNum(r[colRPM])) : [];
-    const pedal = colPedal ? rows.map((r) => toNum(r[colPedal])) : [];
-    const iat = colIAT ? rows.map((r) => toNum(r[colIAT])) : [];
-    const lambda = colLambda ? rows.map((r) => toNum(r[colLambda])) : [];
-    const ign = colIgn ? rows.map((r) => toNum(r[colIgn])) : [];
-    const boostRaw = colBoost ? rows.map((r) => toNum(r[colBoost])) : [];
-
-    // 4) Boost normalization
-    let boostInfo = null;
     if (colBoost) {
-      const { unit } = detectBoostUnit(colBoost, boostRaw);
-      const boostPsiAbs = boostRaw.map((v) => pressureToPsi(v, unit));
-      const sAbs = stats(boostPsiAbs);
+      const unitGuess = detectPressureUnit(boostRawArr);
+      boostMeta.unit = unitGuess.unit;
 
-      let gaugePsi = null;
-      let sGauge = null;
-      if (isProbablyAbsolutePressurePsi(sAbs)) {
-        // abs -> gauge
-        gaugePsi = boostPsiAbs.map((v) => (Number.isFinite(v) ? v - 14.6959 : null));
-        sGauge = stats(gaugePsi);
+      boostPsiArr = boostRawArr.map((v) => pressureToPsi(v, unitGuess.unit)).filter((v) => v !== null);
+
+      const psiStats = minMax(boostPsiArr);
+      const absLikely = likelyAbsolutePressurePsi(psiStats);
+      boostMeta.absoluteLikely = absLikely;
+
+      if (absLikely) {
+        // gauge = abs - 14.7 psi
+        boostPsiGaugeArr = boostRawArr
+          .map((v) => pressureToPsi(v, unitGuess.unit))
+          .map((v) => (v === null ? null : v - 14.7))
+          .filter((v) => v !== null);
+      } else {
+        boostPsiGaugeArr = boostRawArr.map((v) => pressureToPsi(v, unitGuess.unit)).filter((v) => v !== null);
       }
 
-      boostInfo = {
-        column: colBoost,
-        unitDetected: unit,
-        psiAbsolute: sAbs ? { min: sAbs.min, max: sAbs.max } : null,
-        psiGauge: sGauge ? { min: sGauge.min, max: sGauge.max } : null,
-        isAbsoluteLikely: isProbablyAbsolutePressurePsi(sAbs),
-      };
+      boostMeta.detected = colBoost.name;
     }
 
-    // 5) Load state (part/full) heuristic
-    // Full load if pedal/throttle >= 90% OR (pedal missing) rpm high and boost high
-    const pedalStats = stats(pedal);
-    const rpmStats = stats(rpm);
-
-    let fullLoadPct = null;
-    if (pedal.length) {
-      const valid = pedal.filter((x) => Number.isFinite(x));
-      if (valid.length) {
-        const full = valid.filter((x) => x >= 90).length;
-        fullLoadPct = (full / valid.length) * 100;
-      }
-    }
-
-    // 6) Prepare computed metrics (ONLY numbers from here)
-    const metrics = {
-      fileName: req.file.originalname,
-      note,
-      detectedColumns: {
-        rpm: colRPM,
-        pedalOrThrottle: colPedal,
-        iat: colIAT,
-        lambdaOrAfr: colLambda,
-        ignitionOrTiming: colIgn,
-        boostOrPressure: colBoost,
+    // 6) Stats full + WOT
+    const stats = {
+      meta: {
+        rows: rows.length,
+        headerIdx: info.headerIdx,
+        delimiter: info.detectedDelimiter,
+        detectedColumns: {
+          time: colTime?.name || null,
+          rpm: colRpm?.name || null,
+          pedal: colPedal?.name || null,
+          throttle: colThrottle?.name || null,
+          boost: colBoost?.name || null,
+          iat: colIat?.name || null,
+          lambda: colLambda?.name || null,
+          ignition: colIgn?.name || null,
+        },
+        boostInterpretation: boostMeta,
+        noteFromUser: note || null,
       },
-      rpm: rpmStats ? { min: rpmStats.min, max: rpmStats.max } : null,
-      pedal: pedalStats ? { min: pedalStats.min, max: pedalStats.max } : null,
-      iat: stats(iat) ? { min: stats(iat).min, max: stats(iat).max } : null,
-      lambda: stats(lambda) ? { min: stats(lambda).min, max: stats(lambda).max } : null,
-      ignition: stats(ign) ? { min: stats(ign).min, max: stats(ign).max } : null,
-      boost: boostInfo,
-      fullLoadPercent: fullLoadPct,
+      full: {
+        rpm: minMax(rpmArr),
+        iat: minMax(iatArr),
+        lambda: minMax(lambdaArr),
+        ignition: minMax(ignArr),
+        boostPsiGauge: minMax(boostPsiGaugeArr),
+      },
+      wot: {
+        rpm: minMax(filterByMask(rpmArr, wotMask)),
+        iat: minMax(filterByMask(iatArr, wotMask)),
+        lambda: minMax(filterByMask(lambdaArr, wotMask)),
+        ignition: minMax(filterByMask(ignArr, wotMask)),
+        boostPsiGauge: minMax(filterByMask(
+          // need aligned array for mask (rebuild aligned gauge series)
+          colBoost
+            ? boostRawArr.map((v) => {
+                const psi = pressureToPsi(v, boostMeta.unit);
+                if (psi === null) return null;
+                return boostMeta.absoluteLikely ? psi - 14.7 : psi;
+              })
+            : [],
+          wotMask
+        )),
+      },
     };
 
-    // 7) Let GPT write CUSTOMER-FRIENDLY text from computed metrics
-    const prompt = `
-You are SpicyCarWorks Log Assistant.
+    // 7) Provide the model a small dataset (downsample) to reason about relationships
+    // keep only a reasonable subset of columns to reduce tokens
+    const keepCols = [
+      colTime?.name,
+      colRpm?.name,
+      colPedal?.name,
+      colThrottle?.name,
+      colBoost?.name,
+      colIat?.name,
+      colLambda?.name,
+      colIgn?.name,
+    ].filter(Boolean);
 
-IMPORTANT:
-- You receive ONLY computed metrics as JSON below.
-- You MUST NOT invent numbers, columns, or conclusions beyond these metrics.
-- If something is missing/null, say "not available".
-
-Output MUST be:
-ENGLISH first, then GERMAN.
-
-Format EXACT:
-1) Summary (2-4 bullets, customer-friendly)
-2) Key numbers (bullets like a mini table)
-3) Load state (part-throttle vs WOT) based only on pedal/fullLoadPercent if available
-4) Next steps (max 5 bullets)
-NO sales/upsell, NO "contact us", NO marketing.
-
-JSON METRICS:
-${JSON.stringify(metrics, null, 2)}
-`.trim();
-
-    const ai = await openai.responses.create({
-      model: "gpt-4.1",
-      input: prompt,
+    const compactRows = rows.map((r, i) => {
+      const o = { __wot: wotMask[i] ? 1 : 0 };
+      for (const k of keepCols) o[k] = r[k];
+      return o;
     });
 
-    res.json({ text: ai.output_text || "Keine Ausgabe." });
+    const sampleAll = sampleRows(compactRows, 500);
+    const sampleWot = sampleRows(compactRows.filter((r) => r.__wot === 1), 300);
+
+    const payloadForModel = {
+      stats,
+      sample_all: sampleAll,
+      sample_wot: sampleWot,
+    };
+
+    // 8) Ask GPT (NO code interpreter, NO file upload)
+    const instructions = `
+ENGLISH (output first):
+You are the SpicyCarWorks Log Assistant.
+You MUST base every numeric statement ONLY on the provided computed stats in JSON ("stats") and/or values visible in "sample_all/sample_wot". NEVER guess.
+If required columns are missing, explicitly say which ones are missing and avoid conclusions.
+
+Output format EXACTLY:
+1) Summary (2-4 bullet points, customer-friendly, no jargon)
+2) Key numbers (bullets; include FULL and WOT min/max when available for: Boost (psi gauge), RPM, IAT, Lambda/AFR, Ignition)
+3) Findings (Fueling / Timing / Boost / IAT) — only if relevant data exists
+4) Next steps (max 5 bullets)
+
+NO sales, NO upsell, NO “contact us”, NO marketing.
+Language: English first, then German.
+
+DEUTSCH (output second):
+Du bist der SpicyCarWorks Log Assistant.
+Du MUSST jede numerische Aussage NUR auf den bereitgestellten berechneten Werten in JSON ("stats") und/oder auf sichtbaren Werten in "sample_all/sample_wot" stützen. NIEMALS raten.
+Wenn Spalten fehlen, sage klar welche fehlen und ziehe keine falschen Schlüsse.
+
+Ausgabeformat GENAU:
+1) Kurzfazit (2-4 Bullets, kundenfreundlich)
+2) Key Numbers (Bullets; FULL und WOT min/max wenn vorhanden: Boost (psi gauge), RPM, IAT, Lambda/AFR, Ignition)
+3) Findings (Fueling / Timing / Boost / IAT) — nur wenn Daten vorhanden
+4) Next Steps (max 5 Bullets)
+
+KEIN Verkaufston, KEIN Upsell, KEIN “contact us”, KEIN Marketing.
+Sprache: zuerst Englisch, dann Deutsch.
+`.trim();
+
+    const response = await openai.responses.create({
+      model: "gpt-4.1",
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: instructions },
+            {
+              type: "input_text",
+              text:
+                "Here is the normalized log payload (JSON). Use this ONLY:\n" +
+                JSON.stringify(payloadForModel),
+            },
+          ],
+        },
+      ],
+    });
+
+    res.json({ text: response.output_text || "Keine Ausgabe." });
   } catch (e) {
     res.status(500).json({ error: "Analyse fehlgeschlagen: " + (e?.message || String(e)) });
   }
 });
 
+// ---------- Listen ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server läuft auf Port", PORT));
